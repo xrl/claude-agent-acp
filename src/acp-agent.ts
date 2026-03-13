@@ -554,12 +554,101 @@ export class ClaudeAcpAgent implements Agent {
               case "hook_progress":
               case "hook_response":
               case "files_persisted":
-              case "task_started":
-              case "task_notification":
-              case "task_progress":
               case "elicitation_complete":
                 // Todo: process via status api: https://docs.claude.com/en/docs/claude-code/hooks#hook-output
                 break;
+              case "task_started": {
+                // A sub-agent has been spawned. Send a tool_call_update so the
+                // client knows the Agent tool is now actively running.
+                const toolCallId = message.tool_use_id;
+                if (toolCallId) {
+                  await this.client.sessionUpdate({
+                    sessionId: message.session_id,
+                    update: {
+                      sessionUpdate: "tool_call_update",
+                      toolCallId,
+                      status: "running",
+                      title: message.description || "Sub-agent started",
+                      _meta: {
+                        claudeCode: {
+                          toolName: "Agent",
+                          subagentStatus: "started",
+                        },
+                      },
+                    },
+                  });
+                }
+                break;
+              }
+              case "task_progress": {
+                // Sub-agent progress update — forward so the client can show
+                // intermediate status (e.g. which tool the sub-agent is using).
+                const toolCallId = message.tool_use_id;
+                if (toolCallId) {
+                  const progressText = [
+                    message.description,
+                    message.last_tool_name ? `(${message.last_tool_name})` : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ");
+                  await this.client.sessionUpdate({
+                    sessionId: message.session_id,
+                    update: {
+                      sessionUpdate: "tool_call_update",
+                      toolCallId,
+                      status: "running",
+                      ...(progressText
+                        ? {
+                            content: [
+                              {
+                                type: "content" as const,
+                                content: { type: "text" as const, text: progressText },
+                              },
+                            ],
+                          }
+                        : {}),
+                      _meta: {
+                        claudeCode: {
+                          toolName: "Agent",
+                          subagentStatus: "progress",
+                        },
+                      },
+                    },
+                  });
+                }
+                break;
+              }
+              case "task_notification": {
+                // Sub-agent completed or produced a final notification.
+                const toolCallId = message.tool_use_id;
+                if (toolCallId) {
+                  await this.client.sessionUpdate({
+                    sessionId: message.session_id,
+                    update: {
+                      sessionUpdate: "tool_call_update",
+                      toolCallId,
+                      status: message.status === "completed" ? "completed" : "failed",
+                      ...(message.summary
+                        ? {
+                            content: [
+                              {
+                                type: "content" as const,
+                                content: { type: "text" as const, text: message.summary },
+                              },
+                            ],
+                          }
+                        : {}),
+                      _meta: {
+                        claudeCode: {
+                          toolName: "Agent",
+                          subagentStatus: message.status,
+                        },
+                      },
+                    },
+                  });
+                }
+                break;
+              }
               default:
                 unreachable(message, this.logger);
                 break;
@@ -1779,6 +1868,10 @@ export function toAcpNotifications(
                     sessionId,
                     update,
                   });
+                  // Clean up the tool use cache entry now that the hook has
+                  // fired and the tool is fully complete. This prevents
+                  // unbounded growth of the cache over long sessions.
+                  delete toolUseCache[toolUseId];
                 } else {
                   logger.error(
                     `[claude-agent-acp] Got a tool response for tool use that wasn't tracked: ${toolUseId}`,
@@ -1891,6 +1984,7 @@ export function toAcpNotifications(
             ...toolUpdate,
           };
         }
+
         break;
       }
 
